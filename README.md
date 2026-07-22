@@ -72,16 +72,42 @@ To add a custom map:
 
 ## Data Collection and Replay
 
-Collect trajectories:
+Start one human + AI collection session:
 
 ```bash
-python scripts/data_collector.py --map HandOff --input joystick --num 5
+python scripts/data_collector.py
 ```
 
-Replay a collected trajectory:
+The Pygame window collects the participant's Computing ID and email, the
+human-controlled agent color, the AI model, and the map. By default the human
+uses the first connected joystick; pass `--input keyboard` to test with WASD,
+`H` (reverse), and Space (pick up/drop). The other agent runs in a child process
+and exchanges state/actions with the environment process over a localhost
+socket. The current AI model is the seeded `random` placeholder.
+
+Useful optional arguments:
 
 ```bash
-python scripts/reply_collected_trajectory.py --json_path scripts/saved_datasets/HandOff_YYYYMMDDHHMMSS.json --fps 10
+python scripts/data_collector.py --input keyboard
+python scripts/data_collector.py --output saved_datasets --ai-seed 123 --ai-timeout 2
+```
+
+One invocation records one session. A versioned JSON file stores session
+metadata, the trajectory, and questionnaire answers. The questionnaire appears
+after the map is completed or the environment reaches its existing 1000-step
+limit. By default it presents the nine collaboration statements as one question
+per page, each answered on a 7-point Likert scale.
+
+Replay either a legacy trajectory or a new versioned session file:
+
+```bash
+python scripts/replay_collected_trajectory.py --json_path saved_datasets/HandOff_YYYYMMDDHHMMSS_SESSION.json --fps 10
+```
+
+Run the collection tests:
+
+```bash
+python -m unittest discover -s tests -v
 ```
 
 

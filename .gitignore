@@ -210,3 +210,4 @@ __marimo__/
 .streamlit/secrets.toml
 
 *saved_datasets**.distcache.npz
+saved_datasets/
