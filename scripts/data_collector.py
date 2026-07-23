@@ -26,13 +26,17 @@ def main() -> None:
         "--ai-seed",
         type=int,
         default=None,
-        help="Optional seed for reproducible random-model actions.",
+        help="Optional seed for reproducible AI-model actions.",
     )
     parser.add_argument(
         "--ai-timeout",
         type=float,
         default=2.0,
-        help="Maximum seconds to wait for each AI response (default: 2).",
+        help=(
+            "Maximum in-flight AI inference time before the session is "
+            "aborted (default: 2). Environment steps continue while an AI "
+            "response is pending; models may enforce a higher minimum."
+        ),
     )
     parser.add_argument(
         "--input",

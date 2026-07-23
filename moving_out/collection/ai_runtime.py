@@ -10,27 +10,59 @@ import socket
 import struct
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from numbers import Real
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Type
 
 from .records import to_jsonable
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_MESSAGE_BYTES = 2 * 1024 * 1024
 HEADER = struct.Struct("!I")
 
 
+@dataclass(frozen=True)
+class ActionPlan:
+    """A model prediction plus its preferred re-planning chunk size."""
+
+    actions: List[List[Any]]
+    preferred_action_count: int
+
+
+@dataclass(frozen=True)
+class PlanResult:
+    """A validated plan returned across the worker-process boundary."""
+
+    request_id: int
+    source_step: int
+    actions: List[List[Any]]
+    preferred_action_count: int
+
+
 class AIModel(ABC):
     """Interface implemented by every AI model exposed in the UI."""
+
+    startup_timeout = 5.0
+    minimum_response_timeout = 0.0
+    plan_horizon = 1
+    preferred_action_count = 1
 
     @abstractmethod
     def reset(self, agent_index: int, seed: int) -> None:
         raise NotImplementedError
 
     @abstractmethod
-    def predict(self, state: Dict[str, Any]) -> Sequence[Any]:
+    def predict_plan(self, state: Dict[str, Any]) -> ActionPlan:
         raise NotImplementedError
+
+    def predict(self, state: Dict[str, Any]) -> Sequence[Any]:
+        """Compatibility helper returning the first action of a plan."""
+        plan = self.predict_plan(state)
+        if not plan.actions:
+            raise ValueError("AI model returned an empty action plan.")
+        return plan.actions[0]
 
 
 class RandomModel(AIModel):
@@ -44,16 +76,120 @@ class RandomModel(AIModel):
         self.agent_index = agent_index
         self._rng.seed(seed)
 
-    def predict(self, state: Dict[str, Any]) -> Sequence[Any]:
+    def predict_plan(self, state: Dict[str, Any]) -> ActionPlan:
         del state
-        return [
-            self._rng.uniform(0.0, 1.0),
-            self._rng.uniform(-math.pi, math.pi),
-            self._rng.random() < 0.05,
-        ]
+        return ActionPlan(
+            actions=[
+                [
+                    self._rng.uniform(0.0, 1.0),
+                    self._rng.uniform(-math.pi, math.pi),
+                    self._rng.random() < 0.05,
+                ]
+            ],
+            preferred_action_count=1,
+        )
 
 
-MODEL_REGISTRY: Dict[str, Type[AIModel]] = {"random": RandomModel}
+class DiffusionPolicyHandOffModel(AIModel):
+    """Adapter for the two shipped HandOff diffusion-policy checkpoints."""
+
+    startup_timeout = 30.0
+    minimum_response_timeout = 10.0
+    observation_dim = 121
+    plan_horizon = 8
+    preferred_action_count = 2
+    num_inference_steps = 32
+    hold_scale = 5.0
+
+    def __init__(self) -> None:
+        self.agent_index: Optional[int] = None
+        self._encoder: Optional[Any] = None
+        self._policy: Optional[Any] = None
+
+    @staticmethod
+    def checkpoint_path(agent_index: int) -> Path:
+        if agent_index not in (0, 1):
+            raise ValueError("Diffusion policy agent_index must be 0 or 1.")
+        repository_root = Path(__file__).resolve().parents[2]
+        return (
+            repository_root
+            / "movingout_dp_deploy"
+            / f"dp_handoff_robot{agent_index + 1}.pt"
+        )
+
+    @staticmethod
+    def _seed_torch(torch_module: Any, seed: int) -> None:
+        torch_module.manual_seed(seed)
+        if torch_module.cuda.is_available():
+            torch_module.cuda.manual_seed_all(seed)
+
+    def reset(self, agent_index: int, seed: int) -> None:
+        checkpoint_path = self.checkpoint_path(agent_index)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Diffusion checkpoint not found: {checkpoint_path}"
+            )
+
+        try:
+            import torch
+
+            from moving_out.utils.states_encoding import StatesEncoder
+            from movingout_dp_deploy import DiffusionPolicy
+        except ImportError as exc:
+            raise RuntimeError(
+                "Could not import diffusion-policy dependencies. "
+                "Install requirements.txt in the active environment."
+            ) from exc
+
+        self.agent_index = agent_index
+        self._encoder = StatesEncoder(max_number_shaps=7)
+        self._policy = DiffusionPolicy(
+            str(checkpoint_path),
+            device=None,
+            hold_scale=self.hold_scale,
+            num_inference_steps=self.num_inference_steps,
+        )
+
+        # Pay the one-time Torch/kernel initialization cost before reporting
+        # the worker as ready, then restore both policy and RNG state.
+        self._seed_torch(torch, seed)
+        self._policy.get_action_plan([0.0] * self.observation_dim)
+        self._policy.reset()
+        self._seed_torch(torch, seed)
+
+    def predict_plan(self, state: Dict[str, Any]) -> ActionPlan:
+        if (
+            self.agent_index is None
+            or self._encoder is None
+            or self._policy is None
+        ):
+            raise RuntimeError("Diffusion policy must be reset before prediction.")
+        encoded_states = self._encoder.get_state_by_current_obs_states(state)
+        observation = encoded_states[self.agent_index]
+        if len(observation) != self.observation_dim:
+            raise ValueError(
+                "Diffusion policy expected a "
+                f"{self.observation_dim}-dimensional observation, "
+                f"but received {len(observation)} values."
+            )
+        actions = self._policy.get_action_plan(observation)
+        if len(actions) != self.plan_horizon:
+            raise ValueError(
+                "Diffusion policy expected to return "
+                f"{self.plan_horizon} actions, but returned {len(actions)}."
+            )
+        return ActionPlan(
+            actions=[list(action) for action in actions],
+            preferred_action_count=min(
+                self.preferred_action_count, self.plan_horizon
+            ),
+        )
+
+
+MODEL_REGISTRY: Dict[str, Type[AIModel]] = {
+    "random": RandomModel,
+    "diffusion_policy_hand_off": DiffusionPolicyHandOffModel,
+}
 
 
 def validate_action(action: Sequence[Any]) -> List[Any]:
@@ -79,6 +215,27 @@ def validate_action(action: Sequence[Any]) -> List[Any]:
     if not isinstance(interact, bool):
         raise ValueError("AI interact action must be boolean.")
     return [float(magnitude), float(angle), interact]
+
+
+def validate_action_plan(plan: ActionPlan) -> ActionPlan:
+    """Validate every action and the preferred chunk size in a model plan."""
+
+    if not isinstance(plan, ActionPlan):
+        raise ValueError("AI model must return an ActionPlan.")
+    if not isinstance(plan.actions, (list, tuple)) or not plan.actions:
+        raise ValueError("AI action plan must contain at least one action.")
+    if (
+        isinstance(plan.preferred_action_count, bool)
+        or not isinstance(plan.preferred_action_count, int)
+        or not 1 <= plan.preferred_action_count <= len(plan.actions)
+    ):
+        raise ValueError(
+            "AI preferred_action_count must be between 1 and the plan length."
+        )
+    return ActionPlan(
+        actions=[validate_action(action) for action in plan.actions],
+        preferred_action_count=plan.preferred_action_count,
+    )
 
 
 def encode_message(message: Dict[str, Any]) -> bytes:
@@ -171,10 +328,6 @@ def run_ai_worker(
     """Child-process entry point. It intentionally has no UI/environment imports."""
 
     model_class = MODEL_REGISTRY.get(model_name)
-    if model_class is None:
-        return
-    model = model_class()
-    model.reset(agent_index=agent_index, seed=seed)
 
     deadline = time.monotonic() + 5.0
     connection: Optional[socket.socket] = None
@@ -188,6 +341,26 @@ def run_ai_worker(
 
     with connection:
         connection.settimeout(None)
+        try:
+            if model_class is None:
+                raise ValueError(f"Unknown AI model: {model_name!r}")
+            model = model_class()
+            model.reset(agent_index=agent_index, seed=seed)
+        except Exception as exc:
+            try:
+                send_message(
+                    connection,
+                    {
+                        "type": "startup_error",
+                        "protocol_version": PROTOCOL_VERSION,
+                        "model": model_name,
+                        "message": str(exc),
+                    },
+                )
+            except OSError:
+                pass
+            return
+
         send_message(
             connection,
             {
@@ -203,19 +376,29 @@ def run_ai_worker(
                 if message_type == "shutdown":
                     send_message(connection, {"type": "shutdown_ack"})
                     return
-                if message_type != "act":
+                if message_type != "plan":
                     raise ValueError(f"Unsupported message type: {message_type!r}")
                 request_id = message.get("request_id")
+                source_step = message.get("source_step")
                 state = message.get("state")
-                if not isinstance(request_id, int) or not isinstance(state, dict):
-                    raise ValueError("Invalid act request.")
-                action = validate_action(model.predict(state))
+                if (
+                    isinstance(request_id, bool)
+                    or not isinstance(request_id, int)
+                    or isinstance(source_step, bool)
+                    or not isinstance(source_step, int)
+                    or source_step < 0
+                    or not isinstance(state, dict)
+                ):
+                    raise ValueError("Invalid plan request.")
+                plan = validate_action_plan(model.predict_plan(state))
                 send_message(
                     connection,
                     {
-                        "type": "action",
+                        "type": "plan_result",
                         "request_id": request_id,
-                        "action": action,
+                        "source_step": source_step,
+                        "actions": plan.actions,
+                        "preferred_action_count": plan.preferred_action_count,
                     },
                 )
             except Exception as exc:
@@ -241,7 +424,9 @@ class AIProcessClient:
         self._process: Optional[mp.Process] = None
         self._reader = JSONMessageBuffer()
         self._pending_request_id: Optional[int] = None
+        self._pending_source_step: Optional[int] = None
         self._request_started_at: Optional[float] = None
+        self._outgoing = bytearray()
 
     @property
     def pending(self) -> bool:
@@ -278,8 +463,14 @@ class AIProcessClient:
 
         try:
             connection, _ = listener.accept()
+            self._connection = connection
             connection.settimeout(startup_timeout)
             ready = receive_message(connection)
+            if ready.get("type") == "startup_error":
+                raise RuntimeError(
+                    "AI worker could not start "
+                    f"{model_name!r}: {ready.get('message', 'unknown error')}"
+                )
             if (
                 ready.get("type") != "ready"
                 or ready.get("protocol_version") != PROTOCOL_VERSION
@@ -287,7 +478,6 @@ class AIProcessClient:
             ):
                 raise RuntimeError(f"Invalid AI ready message: {ready!r}")
             connection.setblocking(False)
-            self._connection = connection
         except Exception:
             self.close()
             raise
@@ -295,43 +485,94 @@ class AIProcessClient:
             listener.close()
             self._listener = None
 
-    def request_action(self, request_id: int, state: Dict[str, Any]) -> None:
+    def _flush_outgoing(self) -> None:
+        if not self._outgoing:
+            return
+        if self._connection is None:
+            raise ConnectionError("AI process is not connected.")
+        while self._outgoing:
+            try:
+                sent = self._connection.send(self._outgoing)
+            except (BlockingIOError, InterruptedError):
+                return
+            if sent <= 0:
+                raise ConnectionError("AI socket closed while sending a request.")
+            del self._outgoing[:sent]
+
+    def request_plan(
+        self,
+        request_id: int,
+        source_step: int,
+        state: Dict[str, Any],
+    ) -> None:
         if self._connection is None:
             raise RuntimeError("AI process is not connected.")
         if self.pending:
             raise RuntimeError(
-                "Cannot send an action request while another is pending."
+                "Cannot send a plan request while another is pending."
             )
-        self._connection.settimeout(0.5)
-        try:
-            send_message(
-                self._connection,
-                {"type": "act", "request_id": request_id, "state": state},
+        if (
+            isinstance(request_id, bool)
+            or not isinstance(request_id, int)
+            or isinstance(source_step, bool)
+            or not isinstance(source_step, int)
+            or source_step < 0
+            or not isinstance(state, dict)
+        ):
+            raise ValueError("Invalid plan request.")
+        self._outgoing.extend(
+            encode_message(
+                {
+                    "type": "plan",
+                    "request_id": request_id,
+                    "source_step": source_step,
+                    "state": state,
+                }
             )
-        finally:
-            self._connection.setblocking(False)
+        )
         self._pending_request_id = request_id
+        self._pending_source_step = source_step
         self._request_started_at = time.monotonic()
+        self._flush_outgoing()
 
-    def poll_action(self) -> Optional[List[Any]]:
+    def poll_plan(self) -> Optional[PlanResult]:
         if not self.pending:
             return None
         if self._connection is None:
             raise ConnectionError("AI process is not connected.")
+        self._flush_outgoing()
         messages = self._reader.read_available(self._connection)
         for message in messages:
             if message.get("type") == "error":
                 raise RuntimeError(
                     f"AI worker error: {message.get('message', 'unknown')}"
                 )
-            if message.get("type") != "action":
+            if message.get("type") != "plan_result":
                 raise RuntimeError(f"Unexpected AI message: {message!r}")
             if message.get("request_id") != self._pending_request_id:
                 raise RuntimeError("AI response request_id does not match the request.")
-            action = validate_action(message.get("action"))
+            if message.get("source_step") != self._pending_source_step:
+                raise RuntimeError(
+                    "AI response source_step does not match the request."
+                )
+            actions = message.get("actions")
+            preferred_action_count = message.get("preferred_action_count")
+            plan = validate_action_plan(
+                ActionPlan(
+                    actions=actions,
+                    preferred_action_count=preferred_action_count,
+                )
+            )
+            result = PlanResult(
+                request_id=self._pending_request_id,
+                source_step=self._pending_source_step,
+                actions=plan.actions,
+                preferred_action_count=plan.preferred_action_count,
+            )
             self._pending_request_id = None
+            self._pending_source_step = None
             self._request_started_at = None
-            return action
+            return result
         if (
             self._request_started_at is not None
             and time.monotonic() - self._request_started_at > self.response_timeout
@@ -371,4 +612,6 @@ class AIProcessClient:
                 process.join(timeout=1.0)
 
         self._pending_request_id = None
+        self._pending_source_step = None
         self._request_started_at = None
+        self._outgoing.clear()

@@ -17,7 +17,7 @@ from moving_out.utils.data_collection import DataCollector
 from moving_out.utils.joystick_controller import JoystickController
 from moving_out.utils.keyboard_controller import KeyboardController
 
-from .ai_runtime import AIProcessClient, MODEL_REGISTRY
+from .ai_runtime import AIProcessClient, MODEL_REGISTRY, PlanResult
 from .records import (
     CollectionConfig,
     QuestionnaireItem,
@@ -35,6 +35,7 @@ WINDOW_HEIGHT = 900
 UI_FPS = 60
 CONTROL_HZ = 10.0
 CONTROL_INTERVAL = 1.0 / CONTROL_HZ
+IDLE_AI_ACTION = [0.0, 0.0, False]
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 LIKERT_OPTIONS = ["1", "2", "3", "4", "5", "6", "7"]
 
@@ -117,6 +118,54 @@ def compose_joint_action(
     if human_agent == "red":
         return [ai, human]
     raise ValueError(f"Unknown human agent: {human_agent!r}")
+
+
+def align_action_plan(
+    result: PlanResult, current_step: int
+) -> List[Dict[str, Any]]:
+    """Align a returned plan to the next joint control step."""
+
+    if result.source_step > current_step:
+        raise ValueError(
+            "AI plan source_step cannot be greater than the current control step."
+        )
+
+    offset = current_step - result.source_step
+    plan_length = len(result.actions)
+    if offset >= plan_length:
+        count = min(result.preferred_action_count, plan_length)
+        start_index = plan_length - count
+        return [
+            {
+                "action": list(result.actions[plan_index]),
+                "request_id": result.request_id,
+                "source_step": result.source_step,
+                "plan_index": plan_index,
+                "target_step": current_step + relative_index,
+                "usage": "stale_rebased",
+            }
+            for relative_index, plan_index in enumerate(
+                range(start_index, plan_length)
+            )
+        ]
+
+    aligned_actions: List[Dict[str, Any]] = []
+    for relative_index, plan_index in enumerate(range(offset, plan_length)):
+        aligned_actions.append(
+            {
+                "action": list(result.actions[plan_index]),
+                "request_id": result.request_id,
+                "source_step": result.source_step,
+                "plan_index": plan_index,
+                "target_step": result.source_step + plan_index,
+                "usage": (
+                    "preferred"
+                    if relative_index < result.preferred_action_count
+                    else "tail"
+                ),
+            }
+        )
+    return aligned_actions
 
 
 class Button:
@@ -550,8 +599,10 @@ class CollectionApp:
         self.frame: Optional[np.ndarray] = None
         self.score = 0.0
         self.game_started_monotonic: Optional[float] = None
-        self.next_request_at = 0.0
-        self.pending_step: Optional[Dict[str, Any]] = None
+        self.next_control_at = 0.0
+        self.active_action_buffer: List[Dict[str, Any]] = []
+        self.next_ai_request_id = 1
+        self.last_requested_source_step: Optional[int] = None
         self.joint_steps = 0
         self.survey_index = 0
 
@@ -652,11 +703,16 @@ class CollectionApp:
                 self.controller = JoystickController()
             else:
                 self.controller = KeyboardController()
-            self.ai_client = AIProcessClient(response_timeout=self.ai_timeout)
+            model_class = MODEL_REGISTRY[self.config.ai_model]
+            response_timeout = max(
+                self.ai_timeout, model_class.minimum_response_timeout
+            )
+            self.ai_client = AIProcessClient(response_timeout=response_timeout)
             self.ai_client.start(
                 model_name=self.config.ai_model,
                 agent_index=self.config.ai_agent_index,
                 seed=ai_seed,
+                startup_timeout=model_class.startup_timeout,
             )
             self.frame = self.env.render("rgb_array")
             self._set_game_display()
@@ -680,6 +736,13 @@ class CollectionApp:
                     "session_status": "waiting_for_input",
                     "control_hz": CONTROL_HZ,
                     "max_episode_steps": self.env.max_episode_steps,
+                    "async_ai": True,
+                    "ai_plan_horizon": model_class.plan_horizon,
+                    "ai_preferred_action_count": (
+                        model_class.preferred_action_count
+                    ),
+                    "ai_fallback_policy": "queued_plan_then_idle",
+                    "ai_stale_policy": "rebase_last_two",
                 },
                 questionnaire=[
                     QuestionnaireItem(item.question, list(item.options))
@@ -689,7 +752,9 @@ class CollectionApp:
             self.session_path = create_session_path(
                 self.output_dir, self.config.map_id, session_id
             )
-            self.pending_step = None
+            self.active_action_buffer = []
+            self.next_ai_request_id = 1
+            self.last_requested_source_step = None
             self.joint_steps = 0
             self.score = 0.0
             self.input_started = False
@@ -754,8 +819,76 @@ class CollectionApp:
         self.record.metadata["started_at"] = started
         self.record.metadata["session_status"] = "running"
         self.game_started_monotonic = time.monotonic()
-        self.next_request_at = self.game_started_monotonic
+        self.next_control_at = self.game_started_monotonic
         self.state = "GAME"
+
+    def _maybe_request_plan(self) -> None:
+        assert self.env is not None
+        assert self.ai_client is not None
+
+        if self.ai_client.pending:
+            return
+        if self.last_requested_source_step == self.joint_steps:
+            return
+
+        request_id = self.next_ai_request_id
+        source_step = self.joint_steps
+        state = self.env.get_all_states()
+        self.ai_client.request_plan(request_id, source_step, state)
+        self.next_ai_request_id += 1
+        self.last_requested_source_step = source_step
+
+    def _install_plan(self, result: PlanResult) -> None:
+        assert self.config is not None
+        model_class = MODEL_REGISTRY[self.config.ai_model]
+        if len(result.actions) != model_class.plan_horizon:
+            raise ValueError(
+                f"AI model {self.config.ai_model!r} returned "
+                f"{len(result.actions)} actions; expected "
+                f"{model_class.plan_horizon}."
+            )
+        if (
+            result.preferred_action_count
+            != model_class.preferred_action_count
+        ):
+            raise ValueError(
+                f"AI model {self.config.ai_model!r} returned preferred_action_count "
+                f"{result.preferred_action_count}; expected "
+                f"{model_class.preferred_action_count}."
+            )
+        self.active_action_buffer = align_action_plan(
+            result, current_step=self.joint_steps
+        )
+
+    def _service_ai(self) -> None:
+        assert self.ai_client is not None
+
+        result = self.ai_client.poll_plan()
+        if result is not None:
+            self._install_plan(result)
+        self._maybe_request_plan()
+
+    def _next_ai_action(self) -> Tuple[List[Any], Dict[str, Any]]:
+        while (
+            self.active_action_buffer
+            and self.active_action_buffer[0]["target_step"] < self.joint_steps
+        ):
+            del self.active_action_buffer[0]
+
+        if (
+            self.active_action_buffer
+            and self.active_action_buffer[0]["target_step"] == self.joint_steps
+        ):
+            provenance = self.active_action_buffer.pop(0)
+            return list(provenance["action"]), provenance
+
+        return list(IDLE_AI_ACTION), {
+            "request_id": None,
+            "source_step": None,
+            "plan_index": None,
+            "target_step": self.joint_steps,
+            "usage": "idle",
+        }
 
     def _update_game(self) -> None:
         assert self.env is not None
@@ -764,27 +897,29 @@ class CollectionApp:
         assert self.config is not None
         assert self.record is not None
 
-        now = time.monotonic()
         try:
-            if self.pending_step is None and now >= self.next_request_at:
-                request_id = self.joint_steps + 1
-                human_action = self._get_human_action()
-                state = self.env.get_all_states()
-                self.ai_client.request_action(request_id, state)
-                self.pending_step = {
-                    "request_id": request_id,
-                    "human_action": list(human_action),
-                    "state": to_jsonable(state),
-                }
+            self._service_ai()
+        except TimeoutError as exc:
+            self._abort_session("ai_timeout", str(exc))
+            return
+        except (ConnectionError, OSError) as exc:
+            self._abort_session("ai_disconnect", str(exc))
+            return
+        except Exception as exc:
+            self._abort_session("ai_runtime_error", str(exc))
+            return
 
-            if self.pending_step is None:
-                return
-            ai_action = self.ai_client.poll_action()
-            if ai_action is None:
-                return
+        now = time.monotonic()
+        if now < self.next_control_at:
+            return
 
+        try:
+            control_step = self.joint_steps
+            state_before_step = self.env.get_all_states()
+            human_action = self._get_human_action()
+            ai_action, provenance = self._next_ai_action()
             joint_action = compose_joint_action(
-                self.pending_step["human_action"],
+                human_action,
                 ai_action,
                 self.config.human_agent,
             )
@@ -801,20 +936,24 @@ class CollectionApp:
                     "time": now_iso(),
                     "id": self.config.map_id,
                     "step": self.joint_steps,
+                    "control_step": control_step,
                     "environment_step": int(getattr(self.env, "_episode_steps", 0)),
-                    "states": self.pending_step["state"],
+                    "states": to_jsonable(state_before_step),
                     "rew": to_jsonable(reward),
                     "done": done,
                     "terminated": bool(terminated),
                     "truncated": bool(truncated),
                     "action": to_jsonable(joint_action),
+                    "ai_action_source": provenance["usage"],
+                    "ai_plan_request_id": provenance["request_id"],
+                    "ai_plan_source_step": provenance["source_step"],
+                    "ai_plan_index": provenance["plan_index"],
                     "info": to_jsonable(info),
                     "test_mode": False,
                 }
             )
-            self.pending_step = None
-            self.next_request_at = max(
-                self.next_request_at + CONTROL_INTERVAL, time.monotonic()
+            self.next_control_at = max(
+                self.next_control_at + CONTROL_INTERVAL, time.monotonic()
             )
 
             if terminated or eval_score >= 1.0:
@@ -823,10 +962,6 @@ class CollectionApp:
                 self._abort_session("environment_error", "Environment physics failed.")
             elif truncated:
                 self._finish_episode("time_limit")
-        except TimeoutError as exc:
-            self._abort_session("ai_timeout", str(exc))
-        except (ConnectionError, OSError) as exc:
-            self._abort_session("ai_disconnect", str(exc))
         except Exception as exc:
             self._abort_session("runtime_error", str(exc))
 

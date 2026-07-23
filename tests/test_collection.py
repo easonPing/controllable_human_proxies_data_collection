@@ -8,20 +8,28 @@ import uuid
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
+import numpy as np
 import pygame
 
 from moving_out.benchmarks.moving_out import MovingOutEnv
 from moving_out.collection.ai_runtime import (
+    ActionPlan,
     AIProcessClient,
+    DiffusionPolicyHandOffModel,
     JSONMessageBuffer,
+    MODEL_REGISTRY,
+    PlanResult,
     RandomModel,
     encode_message,
     validate_action,
+    validate_action_plan,
 )
 from moving_out.collection.app import (
     CollectionApp,
     DEFAULT_QUESTIONS,
+    IDLE_AI_ACTION,
     LIKERT_OPTIONS,
+    align_action_plan,
     compose_joint_action,
     validate_email,
 )
@@ -74,7 +82,7 @@ class RecordTests(unittest.TestCase):
             save_session(path, record)
             with open(path, "r", encoding="utf-8") as stream:
                 saved = json.load(stream)
-            self.assertEqual(saved["schema_version"], 2)
+            self.assertEqual(saved["schema_version"], 3)
             self.assertEqual(saved["metadata"]["computing_id"], "abc")
             self.assertEqual(saved["questionnaire"][0]["answer"], "a")
             self.assertNotIn("abc", os.path.basename(path))
@@ -98,13 +106,20 @@ class CollectionUITests(unittest.TestCase):
             )
             self.assertEqual(len(app.map_selector.options), 12)
             self.assertEqual(app.map_selector.selected, "HandOff")
-            self.assertEqual(app.model_selector.options, ["random"])
+            self.assertEqual(
+                app.model_selector.options,
+                ["random", "diffusion_policy_hand_off"],
+            )
             self.assertEqual(
                 pygame.display.get_caption()[0], "Moving Out Data Collection"
             )
             app.computing_id_input.text = "abc123"
             app.email_input.text = "person@example.com"
             app.agent_selector.selected = "blue"
+            self.assertEqual(app._config_errors(), {})
+
+            app.model_selector.selected = "diffusion_policy_hand_off"
+            app.map_selector.selected = "Simple"
             self.assertEqual(app._config_errors(), {})
         finally:
             pygame.key.stop_text_input()
@@ -216,15 +231,205 @@ class CollectionUITests(unittest.TestCase):
         finally:
             pygame.key.stop_text_input()
 
+    def test_game_steps_and_records_current_state_while_ai_is_pending(self):
+        from unittest.mock import patch
+
+        class PendingAIClient:
+            pending = True
+
+            def poll_plan(self):
+                return None
+
+            def close(self):
+                pass
+
+        class FakeController:
+            def __init__(self):
+                self.calls = 0
+
+            def get_actions(self):
+                self.calls += 1
+                return [0.5, 0.25, False], [0.0, 0.0, False]
+
+        class FakeEnv:
+            def __init__(self):
+                self.steps = 0
+                self._episode_steps = 0
+
+            def get_all_states(self):
+                return {"state_step": self.steps}
+
+            def step(self, action):
+                self.steps += 1
+                self._episode_steps += 2
+                return None, [0.0, 0.0], False, False, {"eval_score": 0.0}
+
+            def render(self, mode):
+                self.mode = mode
+                return np.zeros((8, 8, 3), dtype=np.uint8)
+
+            def close(self):
+                pass
+
+        app = CollectionApp(input_mode="keyboard")
+        try:
+            app.config = CollectionConfig(
+                "id", "person@example.com", "blue", "random", "HandOff",
+                "keyboard",
+            )
+            app.record = SessionRecord(metadata={})
+            app.env = FakeEnv()
+            app.controller = FakeController()
+            app.ai_client = PendingAIClient()
+            app.next_control_at = 0.0
+
+            monotonic_values = [
+                0.0,
+                0.0,
+                0.05,
+                0.1,
+                0.1,
+                0.2,
+                0.2,
+                0.31,
+                0.31,
+            ]
+            with patch(
+                "moving_out.collection.app.time.monotonic",
+                side_effect=monotonic_values,
+            ):
+                for _ in range(5):
+                    app._update_game()
+
+            self.assertEqual(app.joint_steps, 4)
+            self.assertEqual(app.env.steps, 4)
+            self.assertEqual(app.controller.calls, 4)
+            self.assertEqual(len(app.record.trajectory), 4)
+            step = app.record.trajectory[0]
+            self.assertEqual(step["control_step"], 0)
+            self.assertEqual(step["states"], {"state_step": 0})
+            self.assertEqual(step["ai_action_source"], "idle")
+            self.assertIsNone(step["ai_plan_source_step"])
+            self.assertEqual(step["action"][1], IDLE_AI_ACTION)
+            self.assertEqual(
+                [entry["states"]["state_step"] for entry in app.record.trajectory],
+                [0, 1, 2, 3],
+            )
+        finally:
+            app._close_ai()
+            app._close_environment()
+            pygame.key.stop_text_input()
+
+    def test_new_plan_immediately_replaces_an_old_tail(self):
+        app = CollectionApp(input_mode="keyboard")
+        try:
+            app.config = CollectionConfig(
+                "id",
+                "person@example.com",
+                "blue",
+                "diffusion_policy_hand_off",
+                "HandOff",
+                "keyboard",
+            )
+            app.joint_steps = 103
+            app.active_action_buffer = [
+                {
+                    "action": [0.1, 0.0, False],
+                    "request_id": 1,
+                    "source_step": 90,
+                    "plan_index": 7,
+                    "target_step": 103,
+                    "usage": "tail",
+                }
+            ]
+            actions = [[index / 10, 0.0, False] for index in range(8)]
+            app._install_plan(
+                PlanResult(
+                    request_id=2,
+                    source_step=103,
+                    actions=actions,
+                    preferred_action_count=2,
+                )
+            )
+            self.assertEqual(
+                [entry["request_id"] for entry in app.active_action_buffer],
+                [2] * 8,
+            )
+            self.assertEqual(app.active_action_buffer[0]["plan_index"], 0)
+            self.assertEqual(app.active_action_buffer[0]["usage"], "preferred")
+        finally:
+            pygame.key.stop_text_input()
+
 
 class AIRuntimeTests(unittest.TestCase):
+    def test_diffusion_model_is_registered_with_expected_runtime_settings(self):
+        self.assertEqual(
+            list(MODEL_REGISTRY),
+            ["random", "diffusion_policy_hand_off"],
+        )
+        self.assertEqual(DiffusionPolicyHandOffModel.startup_timeout, 30.0)
+        self.assertEqual(
+            DiffusionPolicyHandOffModel.minimum_response_timeout, 10.0
+        )
+        self.assertEqual(RandomModel.startup_timeout, 5.0)
+        self.assertEqual(RandomModel.minimum_response_timeout, 0.0)
+        self.assertEqual(
+            DiffusionPolicyHandOffModel.checkpoint_path(0).name,
+            "dp_handoff_robot1.pt",
+        )
+        self.assertEqual(
+            DiffusionPolicyHandOffModel.checkpoint_path(1).name,
+            "dp_handoff_robot2.pt",
+        )
+        with self.assertRaises(ValueError):
+            DiffusionPolicyHandOffModel.checkpoint_path(2)
+
+    def test_diffusion_model_encodes_and_selects_its_agent_observation(self):
+        class FakeEncoder:
+            def get_state_by_current_obs_states(self, state):
+                self.state = state
+                return [[0.0] * 121, [1.0] * 121]
+
+        class FakePolicy:
+            def get_action_plan(self, observation):
+                self.observation = observation
+                return [[-0.25, 0.5, True]] * 8
+
+        model = DiffusionPolicyHandOffModel()
+        model.agent_index = 1
+        model._encoder = FakeEncoder()
+        model._policy = FakePolicy()
+
+        state = {"robot_1": {}, "robot_2": {}, "items": []}
+        plan = validate_action_plan(model.predict_plan(state))
+        self.assertEqual(model._encoder.state, state)
+        self.assertEqual(model._policy.observation, [1.0] * 121)
+        self.assertEqual(len(plan.actions), 8)
+        self.assertEqual(plan.preferred_action_count, 2)
+        self.assertEqual(plan.actions[0], [-0.25, 0.5, True])
+
+    def test_diffusion_model_rejects_wrong_observation_size(self):
+        class FakeEncoder:
+            def get_state_by_current_obs_states(self, state):
+                return [[0.0] * 120, [0.0] * 120]
+
+        model = DiffusionPolicyHandOffModel()
+        model.agent_index = 0
+        model._encoder = FakeEncoder()
+        model._policy = object()
+        with self.assertRaisesRegex(ValueError, "121-dimensional"):
+            model.predict_plan({})
+
     def test_random_model_is_seeded_and_valid(self):
         first = RandomModel()
         second = RandomModel()
         first.reset(agent_index=1, seed=42)
         second.reset(agent_index=1, seed=42)
-        first_action = validate_action(first.predict({}))
-        second_action = validate_action(second.predict({}))
+        first_plan = validate_action_plan(first.predict_plan({}))
+        second_plan = validate_action_plan(second.predict_plan({}))
+        first_action = first_plan.actions[0]
+        second_action = second_plan.actions[0]
+        self.assertEqual(first_plan.preferred_action_count, 1)
         self.assertEqual(first_action, second_action)
         self.assertGreaterEqual(first_action[0], 0.0)
         self.assertLessEqual(first_action[0], 1.0)
@@ -241,20 +446,198 @@ class AIRuntimeTests(unittest.TestCase):
             messages.extend(reader.feed(payload[start:end]))
         self.assertEqual([message["type"] for message in messages], ["one", "two"])
 
+    def test_plan_message_uses_source_step_without_source_time(self):
+        payload = encode_message(
+            {
+                "type": "plan",
+                "request_id": 1,
+                "source_step": 3,
+                "state": {},
+            }
+        )
+        self.assertIn(b"source_step", payload)
+        self.assertNotIn(b"source_time", payload)
+
+    def test_action_plan_validator_rejects_bad_chunk_size(self):
+        with self.assertRaisesRegex(ValueError, "preferred_action_count"):
+            validate_action_plan(
+                ActionPlan(
+                    actions=[[0.0, 0.0, False]],
+                    preferred_action_count=2,
+                )
+            )
+
+    def test_diffusion_policy_keeps_single_action_api_compatibility(self):
+        from movingout_dp_deploy.diffusion_policy import DiffusionPolicy
+
+        policy = DiffusionPolicy.__new__(DiffusionPolicy)
+        policy.previous_steps = 0
+        policy.pred_horizon = 8
+        policy.selected_actions = 2
+        policy._history = []
+        policy._plan = []
+        actions = [[index / 10, 0.0, False] for index in range(8)]
+        policy._plan_actions = lambda state: [list(action) for action in actions]
+
+        self.assertEqual(policy.get_action_plan([0.0]), actions)
+        self.assertEqual(policy.get_action([0.0]), actions[0])
+        self.assertEqual(policy.get_action([0.0]), actions[1])
+        self.assertEqual(policy.get_action([0.0]), actions[0])
+
+    def test_plan_alignment_prefers_two_then_keeps_tail(self):
+        actions = [[index / 10, 0.0, False] for index in range(8)]
+        result = PlanResult(
+            request_id=9,
+            source_step=100,
+            actions=actions,
+            preferred_action_count=2,
+        )
+        aligned = align_action_plan(result, current_step=103)
+        self.assertEqual([entry["plan_index"] for entry in aligned], [3, 4, 5, 6, 7])
+        self.assertEqual(
+            [entry["usage"] for entry in aligned],
+            ["preferred", "preferred", "tail", "tail", "tail"],
+        )
+        self.assertEqual(
+            [entry["target_step"] for entry in aligned],
+            [103, 104, 105, 106, 107],
+        )
+
+    def test_fully_stale_plan_rebases_its_last_two_actions(self):
+        actions = [[index / 10, 0.0, False] for index in range(8)]
+        result = PlanResult(
+            request_id=10,
+            source_step=100,
+            actions=actions,
+            preferred_action_count=2,
+        )
+        aligned = align_action_plan(result, current_step=112)
+        self.assertEqual([entry["plan_index"] for entry in aligned], [6, 7])
+        self.assertEqual(
+            [entry["target_step"] for entry in aligned], [112, 113]
+        )
+        self.assertEqual(
+            [entry["usage"] for entry in aligned],
+            ["stale_rebased", "stale_rebased"],
+        )
+        with self.assertRaisesRegex(ValueError, "source_step"):
+            align_action_plan(result, current_step=99)
+
     def test_worker_process_round_trip(self):
         client = AIProcessClient(response_timeout=2.0)
         try:
             client.start("random", agent_index=1, seed=123, startup_timeout=5.0)
-            client.request_action(7, {"robot_1": {}, "robot_2": {}})
+            client.request_plan(
+                7, 42, {"robot_1": {}, "robot_2": {}}
+            )
             deadline = time.monotonic() + 3.0
-            action = None
-            while action is None and time.monotonic() < deadline:
-                action = client.poll_action()
+            result = None
+            while result is None and time.monotonic() < deadline:
+                result = client.poll_plan()
                 time.sleep(0.01)
-            self.assertIsNotNone(action)
-            validate_action(action)
+            self.assertIsNotNone(result)
+            self.assertEqual(result.request_id, 7)
+            self.assertEqual(result.source_step, 42)
+            self.assertEqual(result.preferred_action_count, 1)
+            validate_action(result.actions[0])
         finally:
             client.close()
+
+    def test_worker_reports_diffusion_startup_error_immediately(self):
+        client = AIProcessClient(response_timeout=2.0)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "agent_index"):
+                client.start(
+                    "diffusion_policy_hand_off",
+                    agent_index=2,
+                    seed=123,
+                    startup_timeout=5.0,
+                )
+        finally:
+            client.close()
+
+
+@unittest.skipUnless(
+    os.environ.get("RUN_DIFFUSION_SMOKE") == "1",
+    "Set RUN_DIFFUSION_SMOKE=1 to load both real checkpoints.",
+)
+class DiffusionCheckpointSmokeTests(unittest.TestCase):
+    def test_collection_app_starts_with_diffusion_runtime_limits(self):
+        app = CollectionApp(input_mode="keyboard", ai_timeout=2.0)
+        try:
+            app.computing_id_input.text = "smoke-test"
+            app.email_input.text = "smoke@example.com"
+            app.agent_selector.selected = "blue"
+            app.model_selector.selected = "diffusion_policy_hand_off"
+            app.map_selector.selected = "HandOff"
+            app._start_session()
+
+            self.assertEqual(app.state, "WAITING_FOR_INPUT")
+            self.assertIsNotNone(app.ai_client)
+            self.assertEqual(app.ai_client.response_timeout, 10.0)
+            self.assertEqual(app.config.ai_agent_index, 1)
+            app._start_game_after_input()
+            app._update_game()
+            self.assertEqual(app.joint_steps, 1)
+            self.assertEqual(app.record.trajectory[0]["control_step"], 0)
+            self.assertEqual(
+                app.record.trajectory[0]["ai_action_source"], "idle"
+            )
+            self.assertTrue(app.ai_client.pending)
+
+            deadline = time.monotonic() + 8.0
+            while (
+                all(
+                    step["ai_action_source"] == "idle"
+                    for step in app.record.trajectory
+                )
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+                app._update_game()
+            model_steps = [
+                step
+                for step in app.record.trajectory
+                if step["ai_action_source"] != "idle"
+            ]
+            self.assertTrue(model_steps)
+            self.assertIsNotNone(model_steps[0]["ai_plan_source_step"])
+            self.assertGreater(app.joint_steps, 1)
+        finally:
+            app._close_ai()
+            app._close_environment()
+            app._set_main_display("Moving Out Data Collection")
+            pygame.key.stop_text_input()
+
+    def test_both_real_checkpoints_respond_over_socket(self):
+        env = MovingOutEnv(use_state=False, map_name="HandOff")
+        try:
+            state = env.get_all_states()
+            for agent_index in (0, 1):
+                with self.subTest(agent_index=agent_index):
+                    client = AIProcessClient(response_timeout=10.0)
+                    try:
+                        client.start(
+                            "diffusion_policy_hand_off",
+                            agent_index=agent_index,
+                            seed=123,
+                            startup_timeout=30.0,
+                        )
+                        client.request_plan(agent_index + 1, 0, state)
+                        deadline = time.monotonic() + 12.0
+                        result = None
+                        while result is None and time.monotonic() < deadline:
+                            result = client.poll_plan()
+                            time.sleep(0.01)
+                        self.assertIsNotNone(result)
+                        self.assertEqual(len(result.actions), 8)
+                        self.assertEqual(result.preferred_action_count, 2)
+                        for action in result.actions:
+                            validate_action(action)
+                    finally:
+                        client.close()
+        finally:
+            env.close()
 
 
 class JoystickControllerTests(unittest.TestCase):
@@ -311,15 +694,15 @@ class EnvironmentAndReplayTests(unittest.TestCase):
         client = AIProcessClient(response_timeout=2.0)
         try:
             client.start("random", agent_index=1, seed=9, startup_timeout=5.0)
-            client.request_action(1, env.get_all_states())
+            client.request_plan(1, 0, env.get_all_states())
             deadline = time.monotonic() + 3.0
-            ai_action = None
-            while ai_action is None and time.monotonic() < deadline:
-                ai_action = client.poll_action()
+            result = None
+            while result is None and time.monotonic() < deadline:
+                result = client.poll_plan()
                 time.sleep(0.01)
-            self.assertIsNotNone(ai_action)
+            self.assertIsNotNone(result)
             joint_action = compose_joint_action(
-                [0.0, 0.0, False], ai_action, "blue"
+                [0.0, 0.0, False], result.actions[0], "blue"
             )
             env.step(joint_action)
             self.assertEqual(env._episode_steps, 2)
@@ -341,7 +724,7 @@ class EnvironmentAndReplayTests(unittest.TestCase):
         finally:
             env.close()
 
-    def test_replay_loader_accepts_legacy_and_v2(self):
+    def test_replay_loader_accepts_legacy_v2_and_v3(self):
         step = {"id": "HandOff", "action": [[0, 0, False], [0, 0, False]]}
         self.assertEqual(extract_replay_data([step]), ("HandOff", [step]))
         self.assertEqual(extract_replay_data([[step]]), ("HandOff", [step]))
@@ -351,6 +734,12 @@ class EnvironmentAndReplayTests(unittest.TestCase):
             "trajectory": [step],
         }
         self.assertEqual(extract_replay_data(v2), ("PassOrSplit", [step]))
+        v3 = {
+            "schema_version": 3,
+            "metadata": {"map_id": "HandOff"},
+            "trajectory": [step],
+        }
+        self.assertEqual(extract_replay_data(v3), ("HandOff", [step]))
 
 
 if __name__ == "__main__":

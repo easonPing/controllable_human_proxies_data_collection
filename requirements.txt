@@ -6,3 +6,7 @@ pymunk==6.8.1
 PyYAML==6.0.2
 tqdm==4.66.5
 gymnasium==0.29.1
+torch==2.13.0
+diffusers==0.39.0
+einops==0.8.2
+imageio==2.37.4

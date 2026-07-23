@@ -83,7 +83,11 @@ human-controlled agent color, the AI model, and the map. By default the human
 uses the first connected joystick; pass `--input keyboard` to test with WASD,
 `H` (reverse), and Space (pick up/drop). The other agent runs in a child process
 and exchanges state/actions with the environment process over a localhost
-socket. The current AI model is the seeded `random` placeholder.
+socket. The AI Model dropdown provides the seeded `random` placeholder and
+`diffusion_policy_hand_off`. The diffusion model automatically selects the
+robot-1 or robot-2 checkpoint according to the AI-controlled color. Its
+checkpoints were trained for `HandOff`; other maps remain selectable but are
+not expected to produce reliable behavior.
 
 Useful optional arguments:
 
@@ -92,11 +96,20 @@ python scripts/data_collector.py --input keyboard
 python scripts/data_collector.py --output saved_datasets --ai-seed 123 --ai-timeout 2
 ```
 
-One invocation records one session. A versioned JSON file stores session
-metadata, the trajectory, and questionnaire answers. The questionnaire appears
-after the map is completed or the environment reaches its existing 1000-step
-limit. By default it presents the nine collaboration statements as one question
-per page, each answered on a 7-point Likert scale.
+The diffusion model performs a warm-up before the worker reports ready and
+uses a minimum 10-second response timeout even when `--ai-timeout` is lower.
+During a game, the environment continues stepping at a target 10 Hz while an
+AI plan is pending. Diffusion returns an eight-action plan tagged with the
+state's control step; the collector aligns it to the current step, prefers the
+next two actions, and uses the remaining plan as a fallback. If no plan action
+is available, the AI agent stays still. The timeout is a failure threshold and
+does not pause the environment loop.
+
+One invocation records one session. A schema-v3 JSON file stores session
+metadata, the trajectory, AI-plan provenance, and questionnaire answers. The
+questionnaire appears after the map is completed or the environment reaches
+its existing 1000-step limit. By default it presents the nine collaboration
+statements as one question per page, each answered on a 7-point Likert scale.
 
 Replay either a legacy trajectory or a new versioned session file:
 

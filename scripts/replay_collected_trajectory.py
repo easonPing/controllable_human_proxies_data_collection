@@ -19,16 +19,19 @@ def load_json(file_path):
 
 
 def extract_replay_data(json_data):
-    """Return ``(map_id, steps)`` for legacy and schema-v2 recordings."""
+    """Return ``(map_id, steps)`` for legacy and versioned recordings."""
 
     metadata = {}
     if isinstance(json_data, dict):
-        if json_data.get("schema_version") != 2:
+        schema_version = json_data.get("schema_version")
+        if schema_version not in {2, 3}:
             raise ValueError("Unsupported trajectory object schema.")
         metadata = json_data.get("metadata", {})
         steps = json_data.get("trajectory")
         if not isinstance(metadata, dict) or not isinstance(steps, list):
-            raise ValueError("Invalid schema-v2 trajectory format.")
+            raise ValueError(
+                f"Invalid schema-v{schema_version} trajectory format."
+            )
     elif isinstance(json_data, list):
         if not json_data:
             raise ValueError("Invalid trajectory format: expected a non-empty list.")
