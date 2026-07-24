@@ -123,44 +123,25 @@ def compose_joint_action(
 def align_action_plan(
     result: PlanResult, current_step: int
 ) -> List[Dict[str, Any]]:
-    """Align a returned plan to the next joint control step."""
+    """Rebase a returned plan's first action to the next control step."""
 
     if result.source_step > current_step:
         raise ValueError(
             "AI plan source_step cannot be greater than the current control step."
         )
 
-    offset = current_step - result.source_step
-    plan_length = len(result.actions)
-    if offset >= plan_length:
-        count = min(result.preferred_action_count, plan_length)
-        start_index = plan_length - count
-        return [
-            {
-                "action": list(result.actions[plan_index]),
-                "request_id": result.request_id,
-                "source_step": result.source_step,
-                "plan_index": plan_index,
-                "target_step": current_step + relative_index,
-                "usage": "stale_rebased",
-            }
-            for relative_index, plan_index in enumerate(
-                range(start_index, plan_length)
-            )
-        ]
-
     aligned_actions: List[Dict[str, Any]] = []
-    for relative_index, plan_index in enumerate(range(offset, plan_length)):
+    for plan_index, action in enumerate(result.actions):
         aligned_actions.append(
             {
-                "action": list(result.actions[plan_index]),
+                "action": list(action),
                 "request_id": result.request_id,
                 "source_step": result.source_step,
                 "plan_index": plan_index,
-                "target_step": result.source_step + plan_index,
+                "target_step": current_step + plan_index,
                 "usage": (
                     "preferred"
-                    if relative_index < result.preferred_action_count
+                    if plan_index < result.preferred_action_count
                     else "tail"
                 ),
             }
@@ -742,7 +723,7 @@ class CollectionApp:
                         model_class.preferred_action_count
                     ),
                     "ai_fallback_policy": "queued_plan_then_idle",
-                    "ai_stale_policy": "rebase_last_two",
+                    "ai_plan_alignment_policy": "rebase_from_first_action",
                 },
                 questionnaire=[
                     QuestionnaireItem(item.question, list(item.options))

@@ -100,10 +100,12 @@ The diffusion model performs a warm-up before the worker reports ready and
 uses a minimum 10-second response timeout even when `--ai-timeout` is lower.
 During a game, the environment continues stepping at a target 10 Hz while an
 AI plan is pending. Diffusion returns an eight-action plan tagged with the
-state's control step; the collector aligns it to the current step, prefers the
-next two actions, and uses the remaining plan as a fallback. If no plan action
-is available, the AI agent stays still. The timeout is a failure threshold and
-does not pause the environment loop.
+state's control step. When the plan arrives, the collector maps its first
+action to the current control step, executes the first two actions
+preferentially, and uses the remaining plan as a fallback. It records the
+source step for latency analysis but does not skip predicted actions based on
+latency. If no plan action is available, the AI agent stays still. The timeout
+is a failure threshold and does not pause the environment loop.
 
 One invocation records one session. A schema-v3 JSON file stores session
 metadata, the trajectory, AI-plan provenance, and questionnaire answers. The
