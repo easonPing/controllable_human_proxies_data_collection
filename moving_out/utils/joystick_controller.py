@@ -206,7 +206,7 @@ class JoystickController:
                             -1 if (event.value > 0) else 1
                         )
 
-                if event.axis == 4:
+                if event.axis == 2:
                     if event.value > 0.5:
                         self.move_back[joystick_index] = True
                     elif event.value < 0.5:
