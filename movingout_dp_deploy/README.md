@@ -25,7 +25,7 @@ MovingOut environment, so you can embed the policy in your own runner. Only
 pip install torch diffusers einops numpy imageio
 w
 # 2. the MovingOut environment (from the env repo)
-git clone https://github.com/live-robotics-uva/moving_out_envw
+git clone https://github.com/live-robotics-uva/moving_out_env
 cd moving_out_env && pip install -e . && cd ..
 ```
 
