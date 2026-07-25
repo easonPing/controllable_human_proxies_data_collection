@@ -685,6 +685,16 @@ class CollectionApp:
             else:
                 self.controller = KeyboardController()
             model_class = MODEL_REGISTRY[self.config.ai_model]
+            model_metadata = model_class.session_metadata(
+                self.config.map_id,
+                self.config.ai_agent_index,
+            )
+            if model_metadata.get("ai_checkpoint_fallback"):
+                print(
+                    "No checkpoint trained for map "
+                    f"{self.config.map_id!r}; using "
+                    f"{model_metadata['ai_checkpoint_training_map']} weights."
+                )
             response_timeout = max(
                 self.ai_timeout, model_class.minimum_response_timeout
             )
@@ -694,6 +704,7 @@ class CollectionApp:
                 agent_index=self.config.ai_agent_index,
                 seed=ai_seed,
                 startup_timeout=model_class.startup_timeout,
+                map_id=self.config.map_id,
             )
             self.frame = self.env.render("rgb_array")
             self._set_game_display()
@@ -724,6 +735,7 @@ class CollectionApp:
                     ),
                     "ai_fallback_policy": "queued_plan_then_idle",
                     "ai_plan_alignment_policy": "rebase_from_first_action",
+                    **model_metadata,
                 },
                 questionnaire=[
                     QuestionnaireItem(item.question, list(item.options))

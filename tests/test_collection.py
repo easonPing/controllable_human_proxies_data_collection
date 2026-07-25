@@ -18,6 +18,7 @@ from moving_out.collection.ai_runtime import (
     DiffusionPolicyHandOffModel,
     JSONMessageBuffer,
     MODEL_REGISTRY,
+    MovingOutCheckpointModel,
     PlanResult,
     RandomModel,
     encode_message,
@@ -108,8 +109,26 @@ class CollectionUITests(unittest.TestCase):
             self.assertEqual(app.map_selector.selected, "HandOff")
             self.assertEqual(
                 app.model_selector.options,
-                ["random", "diffusion_policy_hand_off"],
+                [
+                    "random",
+                    "diffusion_policy_hand_off",
+                    "movingout_gamma_stochastic",
+                    "movingout_gamma_deterministic",
+                    "movingout_comedi_stochastic",
+                    "movingout_comedi_deterministic",
+                    "movingout_prism_stochastic",
+                    "movingout_prism_deterministic",
+                ],
             )
+            self.assertLessEqual(
+                app.model_selector._option_rects()[-1][1].bottom,
+                app.screen.get_height(),
+            )
+            for option in app.model_selector.options:
+                self.assertLess(
+                    app.body_font.size(option)[0],
+                    app.model_selector.rect.width - 45,
+                )
             self.assertEqual(
                 pygame.display.get_caption()[0], "Moving Out Data Collection"
             )
@@ -365,7 +384,16 @@ class AIRuntimeTests(unittest.TestCase):
     def test_diffusion_model_is_registered_with_expected_runtime_settings(self):
         self.assertEqual(
             list(MODEL_REGISTRY),
-            ["random", "diffusion_policy_hand_off"],
+            [
+                "random",
+                "diffusion_policy_hand_off",
+                "movingout_gamma_stochastic",
+                "movingout_gamma_deterministic",
+                "movingout_comedi_stochastic",
+                "movingout_comedi_deterministic",
+                "movingout_prism_stochastic",
+                "movingout_prism_deterministic",
+            ],
         )
         self.assertEqual(DiffusionPolicyHandOffModel.startup_timeout, 30.0)
         self.assertEqual(
@@ -419,6 +447,134 @@ class AIRuntimeTests(unittest.TestCase):
         model._policy = object()
         with self.assertRaisesRegex(ValueError, "121-dimensional"):
             model.predict_plan({})
+
+    def test_movingout_model_variants_and_checkpoint_mapping(self):
+        expected = {
+            "movingout_gamma_stochastic": ("GAMMA", False),
+            "movingout_gamma_deterministic": ("GAMMA", True),
+            "movingout_comedi_stochastic": ("COMEDI", False),
+            "movingout_comedi_deterministic": ("COMEDI", True),
+            "movingout_prism_stochastic": ("PRISM", False),
+            "movingout_prism_deterministic": ("PRISM", True),
+        }
+        for model_name, (method, deterministic) in expected.items():
+            with self.subTest(model_name=model_name):
+                model_class = MODEL_REGISTRY[model_name]
+                self.assertTrue(
+                    issubclass(model_class, MovingOutCheckpointModel)
+                )
+                self.assertEqual(model_class.method, method)
+                self.assertEqual(model_class.deterministic, deterministic)
+                self.assertEqual(model_class.plan_horizon, 1)
+                self.assertEqual(model_class.preferred_action_count, 1)
+                for map_id in ("EfficientRoutes", "SequentialRotations"):
+                    for agent_index, color in ((0, "blue"), (1, "red")):
+                        self.assertEqual(
+                            model_class.checkpoint_path(
+                                map_id, agent_index
+                            ).name,
+                            f"{map_id}-{method}-{color}.pt",
+                        )
+
+        fallback = MODEL_REGISTRY[
+            "movingout_prism_stochastic"
+        ].session_metadata("HandOff", 1)
+        self.assertEqual(
+            fallback["ai_checkpoint_name"],
+            "EfficientRoutes-PRISM-red.pt",
+        )
+        self.assertEqual(
+            fallback["ai_checkpoint_training_map"], "EfficientRoutes"
+        )
+        self.assertTrue(fallback["ai_checkpoint_fallback"])
+        self.assertEqual(fallback["ai_action_mode"], "stochastic")
+        with self.assertRaises(ValueError):
+            MODEL_REGISTRY["movingout_prism_stochastic"].checkpoint_path(
+                "HandOff", 2
+            )
+
+    def test_movingout_model_encodes_agent_and_converts_desired_hold(self):
+        from movingout_agents_deploy import MovingOutAgent
+
+        class FakeEncoder:
+            def get_state_by_current_obs_states(self, state):
+                self.state = state
+                return [[0.0] * 121, [1.0] * 121]
+
+        class FakeAgent:
+            env_action = staticmethod(MovingOutAgent.env_action)
+
+            def __init__(self):
+                self.raw = np.asarray([0.5, 0.25, 0.8])
+
+            def act(self, observation, deterministic, generator):
+                self.observation = observation
+                self.deterministic = deterministic
+                self.generator = generator
+                return self.raw
+
+        model = MODEL_REGISTRY["movingout_prism_stochastic"]()
+        model.agent_index = 1
+        model._encoder = FakeEncoder()
+        model._agent = FakeAgent()
+        model._generator = object()
+        state = {
+            "robot_1": {"hold": False},
+            "robot_2": {"hold": False},
+        }
+
+        plan = validate_action_plan(model.predict_plan(state))
+        self.assertEqual(model._encoder.state, state)
+        self.assertEqual(model._agent.observation, [1.0] * 121)
+        self.assertFalse(model._agent.deterministic)
+        self.assertIs(model._agent.generator, model._generator)
+        self.assertEqual(plan.preferred_action_count, 1)
+        self.assertAlmostEqual(plan.actions[0][0], 0.5)
+        self.assertAlmostEqual(plan.actions[0][1], 0.25 * math.pi)
+        self.assertTrue(plan.actions[0][2])
+
+        state["robot_2"]["hold"] = True
+        self.assertFalse(model.predict_plan(state).actions[0][2])
+        model._agent.raw = np.asarray([0.5, 0.25, -0.8])
+        self.assertTrue(model.predict_plan(state).actions[0][2])
+
+    def test_movingout_stochastic_seed_and_deterministic_mode(self):
+        class FakeEncoder:
+            def get_state_by_current_obs_states(self, state):
+                return [[0.0] * 121, [0.0] * 121]
+
+        state = {
+            "robot_1": {"hold": False},
+            "robot_2": {"hold": False},
+        }
+        first = MODEL_REGISTRY["movingout_gamma_stochastic"]()
+        second = MODEL_REGISTRY["movingout_gamma_stochastic"]()
+        first.reset(0, 77, "EfficientRoutes")
+        second.reset(0, 77, "EfficientRoutes")
+        first._encoder = FakeEncoder()
+        second._encoder = FakeEncoder()
+        first_actions = [
+            first.predict_plan(state).actions[0] for _ in range(3)
+        ]
+        second_actions = [
+            second.predict_plan(state).actions[0] for _ in range(3)
+        ]
+        self.assertEqual(first_actions, second_actions)
+
+        deterministic_one = MODEL_REGISTRY[
+            "movingout_gamma_deterministic"
+        ]()
+        deterministic_two = MODEL_REGISTRY[
+            "movingout_gamma_deterministic"
+        ]()
+        deterministic_one.reset(0, 1, "EfficientRoutes")
+        deterministic_two.reset(0, 999, "EfficientRoutes")
+        deterministic_one._encoder = FakeEncoder()
+        deterministic_two._encoder = FakeEncoder()
+        self.assertEqual(
+            deterministic_one.predict_plan(state).actions,
+            deterministic_two.predict_plan(state).actions,
+        )
 
     def test_random_model_is_seeded_and_valid(self):
         first = RandomModel()
@@ -493,17 +649,32 @@ class AIRuntimeTests(unittest.TestCase):
             preferred_action_count=2,
         )
         aligned = align_action_plan(result, current_step=103)
-        self.assertEqual([entry["plan_index"] for entry in aligned], [3, 4, 5, 6, 7])
+        self.assertEqual(
+            [entry["plan_index"] for entry in aligned],
+            [0, 1, 2, 3, 4, 5, 6, 7],
+        )
         self.assertEqual(
             [entry["usage"] for entry in aligned],
-            ["preferred", "preferred", "tail", "tail", "tail"],
+            [
+                "preferred",
+                "preferred",
+                "tail",
+                "tail",
+                "tail",
+                "tail",
+                "tail",
+                "tail",
+            ],
         )
         self.assertEqual(
             [entry["target_step"] for entry in aligned],
-            [103, 104, 105, 106, 107],
+            [103, 104, 105, 106, 107, 108, 109, 110],
+        )
+        self.assertEqual(
+            [entry["source_step"] for entry in aligned], [100] * 8
         )
 
-    def test_fully_stale_plan_rebases_its_last_two_actions(self):
+    def test_old_plan_rebases_its_full_horizon_from_first_action(self):
         actions = [[index / 10, 0.0, False] for index in range(8)]
         result = PlanResult(
             request_id=10,
@@ -512,13 +683,26 @@ class AIRuntimeTests(unittest.TestCase):
             preferred_action_count=2,
         )
         aligned = align_action_plan(result, current_step=112)
-        self.assertEqual([entry["plan_index"] for entry in aligned], [6, 7])
         self.assertEqual(
-            [entry["target_step"] for entry in aligned], [112, 113]
+            [entry["plan_index"] for entry in aligned],
+            [0, 1, 2, 3, 4, 5, 6, 7],
+        )
+        self.assertEqual(
+            [entry["target_step"] for entry in aligned],
+            [112, 113, 114, 115, 116, 117, 118, 119],
         )
         self.assertEqual(
             [entry["usage"] for entry in aligned],
-            ["stale_rebased", "stale_rebased"],
+            [
+                "preferred",
+                "preferred",
+                "tail",
+                "tail",
+                "tail",
+                "tail",
+                "tail",
+                "tail",
+            ],
         )
         with self.assertRaisesRegex(ValueError, "source_step"):
             align_action_plan(result, current_step=99)
@@ -576,6 +760,10 @@ class DiffusionCheckpointSmokeTests(unittest.TestCase):
             self.assertIsNotNone(app.ai_client)
             self.assertEqual(app.ai_client.response_timeout, 10.0)
             self.assertEqual(app.config.ai_agent_index, 1)
+            self.assertEqual(
+                app.record.metadata["ai_plan_alignment_policy"],
+                "rebase_from_first_action",
+            )
             app._start_game_after_input()
             app._update_game()
             self.assertEqual(app.joint_steps, 1)
@@ -601,6 +789,8 @@ class DiffusionCheckpointSmokeTests(unittest.TestCase):
                 if step["ai_action_source"] != "idle"
             ]
             self.assertTrue(model_steps)
+            self.assertEqual(model_steps[0]["ai_plan_index"], 0)
+            self.assertEqual(model_steps[0]["ai_action_source"], "preferred")
             self.assertIsNotNone(model_steps[0]["ai_plan_source_step"])
             self.assertGreater(app.joint_steps, 1)
         finally:
@@ -638,6 +828,155 @@ class DiffusionCheckpointSmokeTests(unittest.TestCase):
                         client.close()
         finally:
             env.close()
+
+
+@unittest.skipUnless(
+    os.environ.get("RUN_MOVINGOUT_AGENTS_SMOKE") == "1",
+    "Set RUN_MOVINGOUT_AGENTS_SMOKE=1 to load all MovingOut checkpoints.",
+)
+class MovingOutAgentsCheckpointSmokeTests(unittest.TestCase):
+    def test_all_twelve_checkpoints_load_and_predict(self):
+        model_names = {
+            "GAMMA": "movingout_gamma_stochastic",
+            "COMEDI": "movingout_comedi_stochastic",
+            "PRISM": "movingout_prism_stochastic",
+        }
+        for map_id in ("EfficientRoutes", "SequentialRotations"):
+            env = MovingOutEnv(use_state=False, map_name=map_id)
+            try:
+                state = env.get_all_states()
+                for method, model_name in model_names.items():
+                    for agent_index in (0, 1):
+                        with self.subTest(
+                            map_id=map_id,
+                            method=method,
+                            agent_index=agent_index,
+                        ):
+                            model = MODEL_REGISTRY[model_name]()
+                            model.reset(
+                                agent_index=agent_index,
+                                seed=123,
+                                map_id=map_id,
+                            )
+                            plan = validate_action_plan(
+                                model.predict_plan(state)
+                            )
+                            self.assertEqual(len(plan.actions), 1)
+                            self.assertEqual(
+                                plan.preferred_action_count, 1
+                            )
+                            validate_action(plan.actions[0])
+            finally:
+                env.close()
+
+    def test_socket_and_collection_app_use_efficient_routes_fallback(self):
+        env = MovingOutEnv(use_state=False, map_name="HandOff")
+        client = AIProcessClient(response_timeout=2.0)
+        try:
+            client.start(
+                "movingout_comedi_stochastic",
+                agent_index=1,
+                seed=123,
+                startup_timeout=5.0,
+                map_id="HandOff",
+            )
+            client.request_plan(5, 17, env.get_all_states())
+            deadline = time.monotonic() + 3.0
+            result = None
+            while result is None and time.monotonic() < deadline:
+                result = client.poll_plan()
+                time.sleep(0.01)
+            self.assertIsNotNone(result)
+            self.assertEqual(result.source_step, 17)
+            self.assertEqual(len(result.actions), 1)
+            self.assertEqual(result.preferred_action_count, 1)
+            validate_action(result.actions[0])
+        finally:
+            client.close()
+            env.close()
+
+        app = CollectionApp(input_mode="keyboard", ai_timeout=2.0)
+        try:
+            app.computing_id_input.text = "agents-smoke"
+            app.email_input.text = "smoke@example.com"
+            app.agent_selector.selected = "blue"
+            app.model_selector.selected = "movingout_comedi_deterministic"
+            app.map_selector.selected = "HandOff"
+            app._start_session()
+
+            self.assertEqual(app.state, "WAITING_FOR_INPUT")
+            metadata = app.record.metadata
+            self.assertEqual(
+                metadata["ai_checkpoint_name"],
+                "EfficientRoutes-COMEDI-red.pt",
+            )
+            self.assertEqual(
+                metadata["ai_checkpoint_training_map"], "EfficientRoutes"
+            )
+            self.assertTrue(metadata["ai_checkpoint_fallback"])
+            self.assertEqual(metadata["ai_action_mode"], "deterministic")
+            self.assertEqual(metadata["ai_plan_horizon"], 1)
+            app._start_game_after_input()
+            deadline = time.monotonic() + 3.0
+            while (
+                not app.record.trajectory
+                or app.record.trajectory[-1]["ai_action_source"] == "idle"
+            ) and time.monotonic() < deadline:
+                app._update_game()
+                time.sleep(0.01)
+            model_steps = [
+                step
+                for step in app.record.trajectory
+                if step["ai_action_source"] != "idle"
+            ]
+            self.assertTrue(model_steps)
+            self.assertEqual(model_steps[0]["ai_plan_index"], 0)
+            self.assertIsNotNone(model_steps[0]["ai_plan_source_step"])
+        finally:
+            app._close_ai()
+            app._close_environment()
+            app._set_main_display("Moving Out Data Collection")
+            pygame.key.stop_text_input()
+
+    def test_supported_maps_select_matching_color_checkpoints(self):
+        cases = [
+            (
+                "EfficientRoutes",
+                "movingout_prism_stochastic",
+                "blue",
+                "EfficientRoutes-PRISM-red.pt",
+            ),
+            (
+                "SequentialRotations",
+                "movingout_gamma_deterministic",
+                "red",
+                "SequentialRotations-GAMMA-blue.pt",
+            ),
+        ]
+        for map_id, model_name, human_agent, checkpoint_name in cases:
+            with self.subTest(map_id=map_id, model_name=model_name):
+                app = CollectionApp(input_mode="keyboard", ai_timeout=2.0)
+                try:
+                    app.computing_id_input.text = "agents-smoke"
+                    app.email_input.text = "smoke@example.com"
+                    app.agent_selector.selected = human_agent
+                    app.model_selector.selected = model_name
+                    app.map_selector.selected = map_id
+                    app._start_session()
+
+                    self.assertEqual(app.state, "WAITING_FOR_INPUT")
+                    self.assertEqual(
+                        app.record.metadata["ai_checkpoint_name"],
+                        checkpoint_name,
+                    )
+                    self.assertFalse(
+                        app.record.metadata["ai_checkpoint_fallback"]
+                    )
+                finally:
+                    app._close_ai()
+                    app._close_environment()
+                    app._set_main_display("Moving Out Data Collection")
+                    pygame.key.stop_text_input()
 
 
 class JoystickControllerTests(unittest.TestCase):

@@ -50,12 +50,20 @@ class AIModel(ABC):
     preferred_action_count = 1
 
     @abstractmethod
-    def reset(self, agent_index: int, seed: int) -> None:
+    def reset(self, agent_index: int, seed: int, map_id: str = "") -> None:
         raise NotImplementedError
 
     @abstractmethod
     def predict_plan(self, state: Dict[str, Any]) -> ActionPlan:
         raise NotImplementedError
+
+    @classmethod
+    def session_metadata(
+        cls, map_id: str, agent_index: int
+    ) -> Dict[str, Any]:
+        """Return model-specific metadata known before the worker starts."""
+        del map_id, agent_index
+        return {}
 
     def predict(self, state: Dict[str, Any]) -> Sequence[Any]:
         """Compatibility helper returning the first action of a plan."""
@@ -72,7 +80,8 @@ class RandomModel(AIModel):
         self._rng = random.Random()
         self.agent_index = 0
 
-    def reset(self, agent_index: int, seed: int) -> None:
+    def reset(self, agent_index: int, seed: int, map_id: str = "") -> None:
+        del map_id
         self.agent_index = agent_index
         self._rng.seed(seed)
 
@@ -123,7 +132,8 @@ class DiffusionPolicyHandOffModel(AIModel):
         if torch_module.cuda.is_available():
             torch_module.cuda.manual_seed_all(seed)
 
-    def reset(self, agent_index: int, seed: int) -> None:
+    def reset(self, agent_index: int, seed: int, map_id: str = "") -> None:
+        del map_id
         checkpoint_path = self.checkpoint_path(agent_index)
         if not checkpoint_path.is_file():
             raise FileNotFoundError(
@@ -186,9 +196,193 @@ class DiffusionPolicyHandOffModel(AIModel):
         )
 
 
+class MovingOutCheckpointModel(AIModel):
+    """Adapter for the map/method/color policies in movingout_agents_deploy."""
+
+    observation_dim = 121
+    supported_checkpoint_maps = {
+        "EfficientRoutes",
+        "SequentialRotations",
+    }
+    fallback_checkpoint_map = "EfficientRoutes"
+    method = ""
+    deterministic = False
+
+    def __init__(self) -> None:
+        self.agent_index: Optional[int] = None
+        self._encoder: Optional[Any] = None
+        self._agent: Optional[Any] = None
+        self._generator: Optional[Any] = None
+
+    @classmethod
+    def action_mode(cls) -> str:
+        return "deterministic" if cls.deterministic else "stochastic"
+
+    @classmethod
+    def checkpoint_training_map(cls, map_id: str) -> str:
+        if map_id in cls.supported_checkpoint_maps:
+            return map_id
+        return cls.fallback_checkpoint_map
+
+    @classmethod
+    def checkpoint_path(cls, map_id: str, agent_index: int) -> Path:
+        if agent_index not in (0, 1):
+            raise ValueError("MovingOut checkpoint agent_index must be 0 or 1.")
+        if cls.method not in {"GAMMA", "COMEDI", "PRISM"}:
+            raise ValueError(f"Unknown MovingOut checkpoint method: {cls.method!r}")
+        color = "blue" if agent_index == 0 else "red"
+        training_map = cls.checkpoint_training_map(map_id)
+        repository_root = Path(__file__).resolve().parents[2]
+        return (
+            repository_root
+            / "movingout_agents_deploy"
+            / "checkpoints"
+            / f"{training_map}-{cls.method}-{color}.pt"
+        )
+
+    @classmethod
+    def session_metadata(
+        cls, map_id: str, agent_index: int
+    ) -> Dict[str, Any]:
+        training_map = cls.checkpoint_training_map(map_id)
+        checkpoint_path = cls.checkpoint_path(map_id, agent_index)
+        return {
+            "ai_model_family": "movingout_agents_deploy",
+            "ai_method": cls.method,
+            "ai_action_mode": cls.action_mode(),
+            "ai_checkpoint_training_map": training_map,
+            "ai_checkpoint_name": checkpoint_path.name,
+            "ai_checkpoint_fallback": map_id not in cls.supported_checkpoint_maps,
+        }
+
+    def reset(self, agent_index: int, seed: int, map_id: str = "") -> None:
+        checkpoint_path = self.checkpoint_path(map_id, agent_index)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"MovingOut checkpoint not found: {checkpoint_path}"
+            )
+
+        try:
+            import torch
+
+            from moving_out.utils.states_encoding import StatesEncoder
+            from movingout_agents_deploy import MovingOutAgent
+        except ImportError as exc:
+            raise RuntimeError(
+                "Could not import MovingOut checkpoint dependencies. "
+                "Install requirements.txt in the active environment."
+            ) from exc
+
+        training_map = self.checkpoint_training_map(map_id)
+        color = "blue" if agent_index == 0 else "red"
+        agent = MovingOutAgent.load(str(checkpoint_path))
+        metadata = getattr(agent, "meta", {})
+        if metadata.get("map") != training_map:
+            raise ValueError(
+                f"Checkpoint map metadata is {metadata.get('map')!r}; "
+                f"expected {training_map!r}."
+            )
+        if metadata.get("robot") != color:
+            raise ValueError(
+                f"Checkpoint robot metadata is {metadata.get('robot')!r}; "
+                f"expected {color!r}."
+            )
+
+        warmup = agent.act(
+            [0.0] * self.observation_dim,
+            deterministic=True,
+        )
+        if len(warmup) != 3:
+            raise ValueError(
+                f"MovingOut checkpoint expected 3 raw actions, got {len(warmup)}."
+            )
+
+        self.agent_index = agent_index
+        self._encoder = StatesEncoder(max_number_shaps=7)
+        self._agent = agent
+        self._generator = None
+        if not self.deterministic:
+            self._generator = torch.Generator(device="cpu").manual_seed(seed)
+
+    def predict_plan(self, state: Dict[str, Any]) -> ActionPlan:
+        if (
+            self.agent_index is None
+            or self._encoder is None
+            or self._agent is None
+        ):
+            raise RuntimeError(
+                "MovingOut checkpoint model must be reset before prediction."
+            )
+
+        encoded_states = self._encoder.get_state_by_current_obs_states(state)
+        observation = encoded_states[self.agent_index]
+        if len(observation) != self.observation_dim:
+            raise ValueError(
+                "MovingOut checkpoint expected a "
+                f"{self.observation_dim}-dimensional observation, "
+                f"but received {len(observation)} values."
+            )
+
+        robot_key = f"robot_{self.agent_index + 1}"
+        robot_state = state.get(robot_key)
+        if not isinstance(robot_state, dict) or not isinstance(
+            robot_state.get("hold"), bool
+        ):
+            raise ValueError(
+                f"MovingOut state must contain boolean {robot_key}.hold."
+            )
+
+        raw_action = self._agent.act(
+            observation,
+            deterministic=self.deterministic,
+            generator=self._generator,
+        )
+        env_action = self._agent.env_action(
+            raw_action,
+            holding=robot_state["hold"],
+        )
+        return ActionPlan(
+            actions=[env_action],
+            preferred_action_count=1,
+        )
+
+
+class MovingOutGammaStochasticModel(MovingOutCheckpointModel):
+    method = "GAMMA"
+
+
+class MovingOutGammaDeterministicModel(MovingOutCheckpointModel):
+    method = "GAMMA"
+    deterministic = True
+
+
+class MovingOutComediStochasticModel(MovingOutCheckpointModel):
+    method = "COMEDI"
+
+
+class MovingOutComediDeterministicModel(MovingOutCheckpointModel):
+    method = "COMEDI"
+    deterministic = True
+
+
+class MovingOutPrismStochasticModel(MovingOutCheckpointModel):
+    method = "PRISM"
+
+
+class MovingOutPrismDeterministicModel(MovingOutCheckpointModel):
+    method = "PRISM"
+    deterministic = True
+
+
 MODEL_REGISTRY: Dict[str, Type[AIModel]] = {
     "random": RandomModel,
     "diffusion_policy_hand_off": DiffusionPolicyHandOffModel,
+    "movingout_gamma_stochastic": MovingOutGammaStochasticModel,
+    "movingout_gamma_deterministic": MovingOutGammaDeterministicModel,
+    "movingout_comedi_stochastic": MovingOutComediStochasticModel,
+    "movingout_comedi_deterministic": MovingOutComediDeterministicModel,
+    "movingout_prism_stochastic": MovingOutPrismStochasticModel,
+    "movingout_prism_deterministic": MovingOutPrismDeterministicModel,
 }
 
 
@@ -324,6 +518,7 @@ def run_ai_worker(
     model_name: str,
     agent_index: int,
     seed: int,
+    map_id: str,
 ) -> None:
     """Child-process entry point. It intentionally has no UI/environment imports."""
 
@@ -345,7 +540,7 @@ def run_ai_worker(
             if model_class is None:
                 raise ValueError(f"Unknown AI model: {model_name!r}")
             model = model_class()
-            model.reset(agent_index=agent_index, seed=seed)
+            model.reset(agent_index=agent_index, seed=seed, map_id=map_id)
         except Exception as exc:
             try:
                 send_message(
@@ -438,6 +633,7 @@ class AIProcessClient:
         agent_index: int,
         seed: int,
         startup_timeout: float = 5.0,
+        map_id: str = "",
     ) -> None:
         if model_name not in MODEL_REGISTRY:
             raise ValueError(f"Unknown AI model: {model_name!r}")
@@ -455,7 +651,7 @@ class AIProcessClient:
         context = mp.get_context("spawn")
         process = context.Process(
             target=run_ai_worker,
-            args=(host, port, model_name, agent_index, seed),
+            args=(host, port, model_name, agent_index, seed, map_id),
             name="moving-out-ai",
         )
         process.start()

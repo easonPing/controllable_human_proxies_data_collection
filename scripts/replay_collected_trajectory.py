@@ -18,16 +18,38 @@ def load_json(file_path):
         return json.load(file)
 
 
-def extract_replay_data(json_data):
+def extract_replay_data(json_data, episode=1):
     """Return ``(map_id, steps)`` for legacy and versioned recordings."""
 
     metadata = {}
     if isinstance(json_data, dict):
         schema_version = json_data.get("schema_version")
-        if schema_version not in {2, 3}:
+        if schema_version == 4:
+            episodes = json_data.get("episodes")
+            if not isinstance(episodes, list) or not episodes:
+                raise ValueError("Invalid schema-v4 study: no episodes.")
+            if (
+                isinstance(episode, bool)
+                or not isinstance(episode, int)
+                or not 1 <= episode <= len(episodes)
+            ):
+                raise ValueError(
+                    f"--episode must be between 1 and {len(episodes)}"
+                )
+            selected = episodes[episode - 1]
+            if not isinstance(selected, dict):
+                raise ValueError("Invalid schema-v4 episode.")
+            metadata = selected
+            steps = selected.get("trajectory")
+        elif schema_version in {2, 3}:
+            if episode != 1:
+                raise ValueError(
+                    "--episode can only be greater than 1 for schema-v4 studies."
+                )
+            metadata = json_data.get("metadata", {})
+            steps = json_data.get("trajectory")
+        else:
             raise ValueError("Unsupported trajectory object schema.")
-        metadata = json_data.get("metadata", {})
-        steps = json_data.get("trajectory")
         if not isinstance(metadata, dict) or not isinstance(steps, list):
             raise ValueError(
                 f"Invalid schema-v{schema_version} trajectory format."
@@ -55,9 +77,9 @@ def extract_replay_data(json_data):
     return map_id, steps
 
 
-def replay_trajectory(json_path, fps):
+def replay_trajectory(json_path, fps, episode=1):
     json_data = load_json(json_path)
-    map_id, steps = extract_replay_data(json_data)
+    map_id, steps = extract_replay_data(json_data, episode=episode)
     env = MovingOutEnv(use_state=False, map_name=map_id)
 
     delay_ms = max(1, int(1000 / fps))
@@ -84,12 +106,20 @@ def main():
     parser = argparse.ArgumentParser(description="Replay a collected trajectory.")
     parser.add_argument("--json_path", type=str, required=True, help="Path to JSON.")
     parser.add_argument("--fps", type=int, default=10, help="Replay FPS.")
+    parser.add_argument(
+        "--episode",
+        type=int,
+        default=1,
+        help="1-based episode number for schema-v4 study files (default: 1).",
+    )
     args = parser.parse_args()
 
     if args.fps < 1:
         raise ValueError("--fps must be >= 1")
+    if args.episode < 1:
+        raise ValueError("--episode must be >= 1")
 
-    replay_trajectory(args.json_path, args.fps)
+    replay_trajectory(args.json_path, args.fps, episode=args.episode)
 
 
 if __name__ == "__main__":

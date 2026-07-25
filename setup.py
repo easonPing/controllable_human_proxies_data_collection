@@ -44,6 +44,9 @@ setup(
     python_requires=">=3.8",
     long_description_content_type="text/markdown",
     packages=find_packages(),
+    package_data={
+        "movingout_agents_deploy": ["checkpoints/*.pt"],
+    },
     # Read requirements from the requirements.txt file
     install_requires=get_requirements("requirements.txt"),
     extras_require={
