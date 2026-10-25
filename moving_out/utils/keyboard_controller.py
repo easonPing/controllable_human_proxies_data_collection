@@ -25,8 +25,12 @@ class KeyboardController:
             (False, False, True, False): math.pi,  # Down
             (False, False, True, True): -3 * math.pi / 4,  # Down-Right
         }
-        # --- ADDED: State trackers for grab keys ---
-        # These will track if the key was pressed in the *previous* frame.
+        self.reset()
+
+    def reset(self):
+        """Clear one-shot key state before a new tutorial/task begins."""
+
+        # These track if the grab key was pressed in the previous frame.
         self.p1_grab_pressed_last_frame = False
         self.p2_grab_pressed_last_frame = False
 
